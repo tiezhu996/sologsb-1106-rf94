@@ -1,6 +1,7 @@
 import { derived, writable } from 'svelte/store'
 import type { Block } from '../types/block'
 import { db } from '../utils/db'
+import { isPrintReadyState } from '../utils/printFlow'
 
 const blockList = writable<Block[]>([])
 
@@ -15,7 +16,7 @@ const statsByDraft = derived(blockList, ($blocks) => {
   for (const block of $blocks) {
     const current = stats[block.draftId] ?? { total: 0, carved: 0, rate: 0 }
     current.total += 1
-    if (block.state === '已刻成' || block.state === '已修版') current.carved += 1
+    if (isPrintReadyState(block.state)) current.carved += 1
     current.rate = current.total === 0 ? 0 : Math.round((current.carved / current.total) * 100)
     stats[block.draftId] = current
   }
@@ -43,7 +44,9 @@ async function update(id: string, changes: Partial<Omit<Block, 'id'>>): Promise<
 async function reorder(ordered: Array<Pick<Block, 'id' | 'colorNo'>>): Promise<void> {
   await db.transaction('rw', db.blocks, async () => {
     for (const item of ordered) {
-      await db.blocks.update(item.id, { colorNo: item.colorNo })
+      const current = await db.blocks.get(item.id)
+      if (!current || current.colorNo === item.colorNo) continue
+      await db.blocks.update(item.id, { colorNo: item.colorNo, rev: current.rev + 1 })
     }
   })
   await load()

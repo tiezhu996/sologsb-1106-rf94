@@ -5,12 +5,17 @@
   import { draftStore } from './stores/draftStore'
   import { blockStore } from './stores/blockStore'
   import { carverStore } from './stores/carverStore'
+  import { subscribeArchiveChanges } from './utils/crossTab'
 
   const firstDraftPath = $derived(`/drafts/${$draftStore[0]?.id ?? 'draft-menshen-qin'}/blocks`)
   const firstBlockPath = $derived(`/blocks/${$blockStore[0]?.id ?? 'block-ms-01'}/nodes`)
 
   onMount(() => {
     void Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+    // 另一标签页提交返修/批次后，本页自动重取档案；提交时仍有乐观锁兜底。
+    return subscribeArchiveChanges(() => {
+      void Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+    })
   })
 </script>
 

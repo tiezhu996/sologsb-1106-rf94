@@ -12,8 +12,15 @@
   import { useBlockOrder } from '../hooks/useBlockOrder'
   import { useCarverLoad } from '../hooks/useCarverLoad'
   import { validateColorSequence } from '../utils/seq'
-  import { db } from '../utils/db'
-  import type { Block } from '../types/block'
+  import {
+    markBlockCarved,
+    reopenForRepair,
+    submitRepair as submitRepairFlow,
+    saveBlockDefect,
+    ReleaseBlockedError,
+    RevisionConflictError,
+  } from '../utils/printFlow'
+import type { Block } from '../types/block'
   import type { ProcessStage } from '../types/node'
 
   const draftId = $derived($params?.id ?? '')
@@ -30,12 +37,30 @@
   let selectedCarverId = $state('')
   let notice = $state('')
   let lastSync = $state('刚刚')
+  let busyBlockId = $state('')
+  let repairDraft = $state<Record<string, { operator: string; durationMin: number; note: string; carverId: string }>>({})
+  let conflictBlockId = $state('')
 
   const draft = $derived($draftStore.find((item) => item.id === draftId) ?? null)
 
   onMount(() => {
     void Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+    // 另一标签页提交后，本页重新可见时先重取，避免按旧版本覆盖。
+    document.addEventListener('visibilitychange', resyncWhenVisible)
+    window.addEventListener('focus', resyncAll)
+    return () => {
+      document.removeEventListener('visibilitychange', resyncWhenVisible)
+      window.removeEventListener('focus', resyncAll)
+    }
   })
+
+  function resyncWhenVisible(): void {
+    if (document.visibilityState === 'visible') void resyncAll()
+  }
+
+  async function resyncAll(): Promise<void> {
+    await Promise.all([draftStore.load(), blockStore.load(), carverStore.load()])
+  }
 
   $effect(() => {
     setBlockDraft(draftId)
@@ -56,7 +81,24 @@
     }
   })
 
+  // 返修表单默认指派「修版」专长刻工
+  $effect(() => {
+    const repairCarver = $carverStore.find((item) => item.specialty === '修版') ?? $carverStore[0]
+    for (const block of $orderedBlocks) {
+      if (block.state !== '返修中') continue
+      if (!repairDraft[block.id]) {
+        repairDraft[block.id] = {
+          operator: repairCarver?.name ?? '秦木生',
+          durationMin: 60,
+          note: block.defectNote,
+          carverId: repairCarver?.id ?? '',
+        }
+      }
+    }
+  })
+
   function blockStateStage(state: Block['state']): number {
+    if (state === '返修中') return 4
     if (state === '待刻' || state === '在刻') return 3
     return 4
   }
@@ -74,24 +116,87 @@
   }
 
   async function markCarved(block: Block): Promise<void> {
-    await blockStore.update(block.id, { state: '已刻成' })
-    await carverStore.releaseBlock(block.id)
-    const currentBlocks = get(blockStore).filter((item) => item.draftId === draftId)
-    const allCarved = currentBlocks.every((item) => item.state === '已刻成' || item.state === '已修版')
-    await draftStore.update(draftId, { status: allCarved ? '可印' : '刻版中' })
-
-    const existing = await db.nodes.where('blockId').equals(block.id).toArray()
-    await db.nodes.add({
-      id: `node-${crypto.randomUUID()}`,
-      blockId: block.id,
-      stage: '刻版',
-      seq: Math.max(0, ...existing.map((node) => node.seq)) + 1,
-      operator: block.carvedBy || '当班刻工',
-      startedAt: new Date().toISOString().slice(0, 16),
-      durationMin: 0,
-      note: '版片验线后标记刻成。',
-    })
+    busyBlockId = block.id
+    conflictBlockId = ''
+    try {
+      // 节点、版片状态、刻工在刻数与画稿可印结论同一事务提交，失败整笔回滚。
+      await markBlockCarved({ blockId: block.id, expectedRev: block.rev })
+    } catch (error) {
+      await handleFlowError(block, error)
+      return
+    } finally {
+      busyBlockId = ''
+    }
+    await resyncAll()
     lastSync = `${block.blockName}已标记刻成`
+  }
+
+  // 崩口返修退回：版片转「返修中」，修版刻工在刻数 +1，画稿可印结论立即失效重算。
+  async function startRepair(block: Block): Promise<void> {
+    const repairCarver = $carverStore.find((item) => item.specialty === '修版') ?? $carverStore[0]
+    if (!repairCarver) {
+      notice = '请先登记一名修版刻工。'
+      return
+    }
+    busyBlockId = block.id
+    conflictBlockId = ''
+    try {
+      await reopenForRepair({
+        blockId: block.id,
+        expectedRev: block.rev,
+        repairCarverId: repairCarver.id,
+        defectNote: defectDraft[block.id] ?? block.defectNote,
+      })
+    } catch (error) {
+      await handleFlowError(block, error)
+      return
+    } finally {
+      busyBlockId = ''
+    }
+    await resyncAll()
+    lastSync = `${block.blockName}已退回返修`
+  }
+
+  // 返修提交：追加修版节点、版片转「已修版」、刻工在刻数 -1、重算可印结论。
+  async function completeRepair(block: Block): Promise<void> {
+    const form = repairDraft[block.id]
+    if (!form) return
+    if (!form.operator.trim()) {
+      notice = '请填写修版操作人。'
+      conflictBlockId = block.id
+      return
+    }
+    busyBlockId = block.id
+    conflictBlockId = ''
+    try {
+      await submitRepairFlow({
+        blockId: block.id,
+        expectedRev: block.rev,
+        repairNote: form.note.trim() || '崩口返修完成，验版合格。',
+        operator: form.operator.trim(),
+        durationMin: Math.max(0, Number(form.durationMin) || 0),
+      })
+    } catch (error) {
+      await handleFlowError(block, error)
+      return
+    } finally {
+      busyBlockId = ''
+    }
+    await resyncAll()
+    lastSync = `${block.blockName}返修验版完成`
+  }
+
+  // 写入失败：事务已恢复原状；重读后向后提交者亮冲突提示，不覆盖前一次记录。
+  async function handleFlowError(block: Block, error: unknown): Promise<void> {
+    await resyncAll()
+    conflictBlockId = block.id
+    if (error instanceof RevisionConflictError) {
+      notice = `提交冲突：${block.blockName}已被另一处提交先行修改，本次操作未生效，请核对最新记录后重试。`
+    } else if (error instanceof ReleaseBlockedError) {
+      notice = error.message
+    } else {
+      notice = `${block.blockName}写入失败，状态已恢复原状，请重试。`
+    }
   }
 
   async function saveSequence(block: Block): Promise<void> {
@@ -104,7 +209,7 @@
       return
     }
 
-    await blockStore.update(block.id, { colorNo: next })
+    await blockStore.update(block.id, { colorNo: next, rev: block.rev + 1 })
     notice = `${block.blockName}色序已改为 ${next}`
     lastSync = '套色序号已存档'
     await tick()
@@ -127,7 +232,21 @@
   }
 
   async function saveDefect(block: Block): Promise<void> {
-    await blockStore.update(block.id, { defectNote: defectDraft[block.id] ?? '' })
+    busyBlockId = block.id
+    conflictBlockId = ''
+    try {
+      await saveBlockDefect({
+        blockId: block.id,
+        expectedRev: block.rev,
+        defectNote: defectDraft[block.id] ?? '',
+      })
+    } catch (error) {
+      await handleFlowError(block, error)
+      return
+    } finally {
+      busyBlockId = ''
+    }
+    await blockStore.load()
     lastSync = `${block.blockName}崩口记录已更新`
   }
 
@@ -135,7 +254,12 @@
     const block = $orderedBlocks[0]
     if (!block) return
     if (stage === '刻版' || stage === '修版') {
-      await blockStore.update(block.id, { state: stage === '修版' ? '已修版' : '在刻' })
+      const nextState = stage === '修版' ? '已修版' : '在刻'
+      await blockStore.update(block.id, { state: nextState, rev: block.rev + 1 })
+      // 版片状态一变，画稿可印结论失效重算
+      const currentBlocks = get(blockStore).filter((item) => item.draftId === draftId)
+      const ready = currentBlocks.every((item) => item.state === '已刻成' || item.state === '已修版')
+      await draftStore.update(draftId, { status: ready ? '可印' : '刻版中' })
       lastSync = `已将首块版片阶段调至${stage}`
     }
   }
@@ -171,8 +295,12 @@
     <div><span>版片总数</span><strong>{$orderedBlocks.length}</strong></div>
     <div><span>刻成率</span><strong>{$blockCarvedRate}%</strong></div>
     <div><span>在刻版片</span><strong>{$orderedBlocks.filter((block) => block.state === '在刻').length}</strong></div>
-    <div><span>需修版片</span><strong>{$orderedBlocks.filter((block) => block.defectNote).length}</strong></div>
+    <div><span>返修中</span><strong data-testid="count-repairing">{$orderedBlocks.filter((block) => block.state === '返修中').length}</strong></div>
   </section>
+
+  {#if notice}
+    <p class="notice banner" data-testid="board-notice">{notice}</p>
+  {/if}
 
   <div class="workbench-grid">
     <section class="panel table-panel wide-panel">
@@ -237,9 +365,30 @@
                     </select>
                   </td>
                   <td>
-                    <span class="tag state-{block.state}">{block.state}</span>
-                    {#if block.state !== '已刻成' && block.state !== '已修版'}
-                      <button class="mini-button strong" type="button" onclick={() => markCarved(block)}>标刻成</button>
+                    <span class="tag state-{block.state}" data-testid={`state-${block.id}`}>{block.state}</span>
+                    <small class="rev-mark">v{block.rev}</small>
+                    <div class="state-actions">
+                      {#if block.state === '待刻' || block.state === '在刻'}
+                        <button
+                          class="mini-button strong"
+                          type="button"
+                          disabled={busyBlockId === block.id}
+                          data-testid={`mark-carved-${block.id}`}
+                          onclick={() => markCarved(block)}
+                        >标刻成</button>
+                      {/if}
+                      {#if block.state === '已刻成' || block.state === '已修版'}
+                        <button
+                          class="mini-button warn"
+                          type="button"
+                          disabled={busyBlockId === block.id}
+                          data-testid={`start-repair-${block.id}`}
+                          onclick={() => startRepair(block)}
+                        >崩口返修</button>
+                      {/if}
+                    </div>
+                    {#if conflictBlockId === block.id}
+                      <p class="conflict-tip" data-testid={`conflict-${block.id}`}>与另一处提交冲突，请核对上方最新状态后重试。</p>
                     {/if}
                   </td>
                   <td>
@@ -249,14 +398,59 @@
                       bind:value={defectDraft[block.id]}
                       placeholder="崩口、补线或嵌木说明"
                     ></textarea>
-                    <button class="mini-button" type="button" onclick={() => saveDefect(block)}>存记录</button>
+                    <button class="mini-button" type="button" disabled={busyBlockId === block.id} onclick={() => saveDefect(block)}>存记录</button>
+                    {#if block.state === '返修中' && repairDraft[block.id]}
+                      <div class="repair-form" data-testid={`repair-form-${block.id}`}>
+                        <label>
+                          <span>修版人</span>
+                          <input
+                            data-testid={`repair-operator-${block.id}`}
+                            bind:value={repairDraft[block.id]!.operator}
+                            placeholder="修版刻工"
+                          />
+                        </label>
+                        <label>
+                          <span>耗时（分）</span>
+                          <input
+                            type="number"
+                            min="0"
+                            data-testid={`repair-duration-${block.id}`}
+                            bind:value={repairDraft[block.id]!.durationMin}
+                          />
+                        </label>
+                        <label class="wide">
+                          <span>修版记录</span>
+                          <textarea
+                            rows="2"
+                            data-testid={`repair-note-${block.id}`}
+                            bind:value={repairDraft[block.id]!.note}
+                            placeholder="嵌补、压平与试印情况"
+                          ></textarea>
+                        </label>
+                        <button
+                          class="mini-button strong"
+                          type="button"
+                          disabled={busyBlockId === block.id}
+                          data-testid={`complete-repair-${block.id}`}
+                          onclick={() => completeRepair(block)}
+                        >{busyBlockId === block.id ? '提交中…' : '提交返修放行'}</button>
+                      </div>
+                    {/if}
                   </td>
                 </tr>
                 <tr class="stage-row">
                   <td colspan="6">
                     <StageRail
                       activeIndex={blockStateStage(block.state)}
-                      completedCount={block.state === '已刻成' || block.state === '已修版' ? 5 : block.state === '在刻' ? 3 : 1}
+                      completedCount={
+                        block.state === '已刻成' || block.state === '已修版'
+                          ? 5
+                          : block.state === '返修中'
+                            ? 4
+                            : block.state === '在刻'
+                              ? 3
+                              : 1
+                      }
                       compact={true}
                       onselect={block.id === $orderedBlocks[0]?.id ? returnToStage : undefined}
                     />
@@ -297,3 +491,65 @@
     </aside>
   </div>
 {/if}
+
+<style>
+  .rev-mark {
+    color: var(--ink-muted);
+    font-size: 0.72rem;
+  }
+
+  .state-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.35rem;
+  }
+
+  .mini-button.warn {
+    color: var(--cinnabar);
+    border-color: rgba(174, 52, 39, 0.5);
+  }
+
+  .state-返修中 {
+    color: var(--cinnabar);
+    background: #fde8e2;
+    border: 1px solid #e7b4a6;
+  }
+
+  .repair-form {
+    margin-top: 0.5rem;
+    padding: 0.6rem;
+    border: 1px dashed rgba(174, 52, 39, 0.55);
+    border-radius: 8px;
+    background: #fdf6f4;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.45rem;
+  }
+
+  .repair-form .wide {
+    grid-column: 1 / -1;
+  }
+
+  .repair-form label {
+    display: grid;
+    gap: 0.2rem;
+    font-size: 0.78rem;
+  }
+
+  .conflict-tip {
+    margin: 0.35rem 0 0;
+    color: var(--cinnabar);
+    font-size: 0.76rem;
+    font-weight: 650;
+  }
+
+  .notice.banner {
+    margin: 0.6rem 0;
+    padding: 0.55rem 0.8rem;
+    border-radius: 8px;
+    background: #fbeed3;
+    color: #8a5a16;
+    border: 1px solid #e4c78e;
+  }
+</style>

@@ -3,9 +3,17 @@
   import EmptyBox from '../components/common/EmptyBox.svelte'
   import { draftStore } from '../stores/draftStore'
   import { blockStore } from '../stores/blockStore'
+  import { carverStore } from '../stores/carverStore'
   import { buildDeviationNote } from '../utils/seq'
   import { downloadJson } from '../utils/export'
   import { db } from '../utils/db'
+  import {
+    evaluateReadiness,
+    registerPrintBatch,
+    ReleaseBlockedError,
+    RevisionConflictError,
+  } from '../utils/printFlow'
+  import { subscribeArchiveChanges } from '../utils/crossTab'
   import type { PrintBatch } from '../types/batch'
 
   let batches = $state<PrintBatch[]>([])
@@ -20,14 +28,21 @@
   let qcNote = $state('')
   let deviations = $state<Record<string, string>>({})
   let formMessage = $state('')
+  let messageTone = $state<'warn' | 'info'>('warn')
+  let submitting = $state(false)
 
   const selectedDraft = $derived($draftStore.find((draft) => draft.id === draftId) ?? null)
   const selectedBlocks = $derived(
     draftId ? [...$blockStore].filter((block) => block.draftId === draftId).sort((a, b) => a.colorNo - b.colorNo) : [],
   )
+  // 放行结论始终按当前版片状态重算
+  const readiness = $derived(evaluateReadiness(selectedBlocks))
 
   onMount(() => {
-    void Promise.all([draftStore.load(), blockStore.load(), refreshBatches()])
+    void Promise.all([draftStore.load(), blockStore.load(), carverStore.load(), refreshBatches()])
+    return subscribeArchiveChanges(() => {
+      void Promise.all([blockStore.load(), refreshBatches()])
+    })
   })
 
   async function refreshBatches(): Promise<void> {
@@ -39,6 +54,8 @@
   function openForm(): void {
     showForm = true
     formMessage = ''
+    // 打表即取当前版片状态，放行结论不依据本标签页缓存
+    void blockStore.load()
     if (!draftId) {
       const firstDraft = $draftStore[0]
       if (firstDraft) selectDraft(firstDraft.id)
@@ -48,6 +65,7 @@
   function selectDraft(nextId: string): void {
     draftId = nextId
     deviations = {}
+    formMessage = ''
     const target = $draftStore.find((draft) => draft.id === nextId)
     if (target) batchNo = `${target.title}-${new Date().getFullYear()}-01`
   }
@@ -58,7 +76,13 @@
 
   async function submitBatch(): Promise<void> {
     if (!draftId || !batchNo.trim() || !paperBatch.trim() || qty <= 0 || pieceCount <= 0) {
+      messageTone = 'warn'
       formMessage = '请选择画稿，并补全批次号、纸张批号和印数。'
+      return
+    }
+    if (!readiness.ready) {
+      messageTone = 'warn'
+      formMessage = `暂不能开印：${readiness.reasons.join('；')}`
       return
     }
 
@@ -68,20 +92,42 @@
         deviation: deviations[block.id] ?? '',
       })),
     )
+    const mergedQcNote = qcNote.trim() ? `${qcNote.trim()}；${deviationText}` : deviationText
+    // 表单依据的版片版本随提交带上，供事务内拦截后提交者
+    const expectedRevs = Object.fromEntries(selectedBlocks.map((block) => [block.id, block.rev]))
 
-    await db.batches.add({
-      id: `batch-${crypto.randomUUID()}`,
-      draftId,
-      batchNo: batchNo.trim(),
-      printedAt,
-      paperBatch: paperBatch.trim(),
-      inkNote: inkNote.trim() || '颜料与胶量待续记',
-      qty: Number(qty),
-      pieceCount: Number(pieceCount),
-      qcNote: qcNote.trim() ? `${qcNote.trim()}；${deviationText}` : deviationText,
-    })
+    submitting = true
+    try {
+      await registerPrintBatch({
+        draftId,
+        batchNo: batchNo.trim(),
+        printedAt,
+        paperBatch: paperBatch.trim(),
+        inkNote: inkNote.trim() || '颜料与胶量待续记',
+        qty: Number(qty),
+        pieceCount: Number(pieceCount),
+        qcNote: mergedQcNote,
+        expectedRevs,
+      })
+    } catch (error) {
+      // 写入失败：事务已回滚，不留下半套状态；重读版片与批次后给出冲突/拦截提示。
+      await Promise.all([blockStore.load(), refreshBatches()])
+      submitting = false
+      if (error instanceof RevisionConflictError) {
+        messageTone = 'warn'
+        formMessage = `版片档案冲突，本批次未保存：${error.message}`
+      } else if (error instanceof ReleaseBlockedError) {
+        messageTone = 'warn'
+        formMessage = `放行未通过，本批次未保存：${error.message}`
+      } else {
+        messageTone = 'warn'
+        formMessage = '批次保存失败，版片与批次档案均未改动，请重试。'
+      }
+      return
+    }
 
     await refreshBatches()
+    submitting = false
     showForm = false
     batchNo = ''
     paperBatch = ''
@@ -172,6 +218,28 @@
     </div>
 
     {#if selectedDraft}
+      <div class="release-gate" class:blocked={!readiness.ready} data-testid="release-gate">
+        <div class="section-title-row">
+          <div>
+            <span class="section-kicker">开印放行</span>
+            <h3>{selectedDraft.title}当前版片状态</h3>
+          </div>
+          <span class="tag {readiness.ready ? 'tag-pass' : 'tag-block'}">{readiness.ready ? '可放行开印' : '禁止开印'}</span>
+        </div>
+        <ul class="basis-list">
+          {#each readiness.blocks as block}
+            <li class:blocked={!(block.state === '已刻成' || block.state === '已修版')}>
+              <b>{block.colorNo}{block.blockName}</b>
+              <span>{block.state} · v{block.rev}</span>
+              <em>{block.defectNote || '无崩口记录'}</em>
+            </li>
+          {/each}
+        </ul>
+        {#if !readiness.ready}
+          <p class="gate-reasons" data-testid="release-reasons">{readiness.reasons.join('；')}</p>
+        {/if}
+      </div>
+
       <div class="deviation-block">
         <div class="section-title-row">
           <div>
@@ -201,9 +269,11 @@
       <textarea data-testid="field-qcNote" rows="2" bind:value={qcNote} placeholder="走版、纸面洇墨与整体套准情况"></textarea>
     </label>
 
-    {#if formMessage}<p class="form-message">{formMessage}</p>{/if}
+    {#if formMessage}<p class="form-message {messageTone === 'info' ? 'info' : ''}" data-testid="batch-form-message">{formMessage}</p>{/if}
     <div class="form-actions">
-      <button class="button primary" data-testid="submit-batch" type="button" onclick={submitBatch}>保存批次</button>
+      <button class="button primary" data-testid="submit-batch" type="button" disabled={submitting || !readiness.ready} onclick={submitBatch}>
+        {submitting ? '正在放行…' : '保存批次并放行开印'}
+      </button>
       <button class="button ghost" type="button" onclick={() => (showForm = false)}>取消</button>
     </div>
   </section>
@@ -224,6 +294,9 @@
           <span>{batch.printedAt.replace(/-/g, '.')}</span>
           <h2>{batch.batchNo}</h2>
           <p>{draftTitle(batch.draftId)} · {batch.paperBatch}</p>
+          <span class="tag {batch.releaseStatus === '已放行' ? 'tag-pass' : 'tag-review'}" data-testid={`release-${batch.id}`}>
+            {batch.releaseStatus}
+          </span>
         </div>
         <div class="batch-counts">
           <div><span>总印数</span><strong>{batch.qty}</strong></div>
@@ -232,8 +305,108 @@
         <div class="batch-notes">
           <p><b>颜料胶量：</b>{batch.inkNote}</p>
           <p><b>套色检查：</b>{batch.qcNote}</p>
+          <p class="release-basis"><b>放行依据：</b>{batch.releaseBasis}</p>
+          {#if batch.releaseStatus === '已放行' && batch.blockSnapshots.length > 0}
+            <ul class="snapshot-list">
+              {#each batch.blockSnapshots as snapshot}
+                <li>
+                  <b>{snapshot.colorNo}{snapshot.blockName}</b>
+                  <span>{snapshot.state} · v{snapshot.rev}</span>
+                  <em>{snapshot.defectNote || '无崩口记录'}</em>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
       </article>
     {/each}
   </section>
 {/if}
+
+<style>
+  .release-gate {
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--jade);
+    border-radius: 10px;
+    padding: 0.9rem 1rem;
+    margin: 0.4rem 0 1rem;
+    background: #f4faf5;
+  }
+
+  .release-gate.blocked {
+    border-left-color: var(--cinnabar);
+    background: #fdf4f1;
+  }
+
+  .basis-list,
+  .snapshot-list {
+    list-style: none;
+    margin: 0.6rem 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 0.5rem;
+  }
+
+  .basis-list li,
+  .snapshot-list li {
+    display: grid;
+    gap: 0.15rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--paper);
+    font-size: 0.82rem;
+  }
+
+  .basis-list li.blocked {
+    border-color: rgba(174, 52, 39, 0.45);
+    background: #fdeeea;
+  }
+
+  .basis-list em,
+  .snapshot-list em {
+    color: var(--ink-muted);
+    font-style: normal;
+    font-size: 0.78rem;
+  }
+
+  .gate-reasons {
+    margin: 0.6rem 0 0;
+    color: var(--cinnabar);
+    font-weight: 650;
+    font-size: 0.86rem;
+  }
+
+  .tag-pass {
+    color: #1f6b45;
+    background: #ddf2e5;
+    border: 1px solid #9bd4b2;
+  }
+
+  .tag-block {
+    color: var(--cinnabar);
+    background: #fde8e2;
+    border: 1px solid #e7b4a6;
+  }
+
+  .tag-review {
+    color: #8a5a16;
+    background: #fbeed3;
+    border: 1px solid #e4c78e;
+  }
+
+  .release-basis {
+    color: var(--ink-muted);
+    font-size: 0.82rem;
+  }
+
+  .snapshot-list {
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    margin-top: 0.4rem;
+  }
+
+  .form-message.info {
+    color: #1f6b45;
+  }
+</style>

@@ -13,7 +13,10 @@ export function useCarverLoad(carverId: string) {
     ([$carverId, $assignments, $blocks]) => {
       if (!$carverId) return 0
       const assignedIds = $assignments[$carverId] ?? []
-      return $blocks.filter((block) => assignedIds.includes(block.id) && block.state === '在刻').length
+      // 在刻与返修中都算刻工手头在做的版片
+      return $blocks.filter(
+        (block) => assignedIds.includes(block.id) && (block.state === '在刻' || block.state === '返修中'),
+      ).length
     },
   )
 

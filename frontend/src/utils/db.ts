@@ -41,6 +41,35 @@ class WoodprintDatabase extends Dexie {
           })
         }
       })
+
+    // v3：返修放行。版片引入 rev 乐观锁与「返修中」状态；批次保存放行结论与四块版片快照。
+    this.version(3)
+      .stores({
+        drafts: 'id, genre, status, title, schemaRev',
+        blocks: 'id, draftId, colorNo, carvedBy, state, schemaRev, rev',
+        carvers: 'id, specialty, skillLevel, name, schemaRev',
+        batches: 'id, draftId, batchNo, printedAt, schemaRev, releaseStatus',
+        nodes: 'id, batchId, blockId, stage, seq, operator, schemaRev',
+      })
+      .upgrade(async (transaction) => {
+        // 旧版片回填版本号；没有「返修中」旧数据，状态保持原样。
+        await transaction.table('blocks').toCollection().modify((record: StoredRecord) => {
+          record.rev = 1
+          record.schemaRev = 3
+        })
+        // 旧批次只标待复核，绝不改写原印数、每版印次与套色偏差；没有快照可回溯。
+        await transaction.table('batches').toCollection().modify((record: StoredRecord) => {
+          record.releaseStatus = '待复核'
+          record.blockSnapshots = []
+          record.releaseBasis = '历史批次：登记时未留存版片状态与崩口快照，请管事复核。'
+          record.schemaRev = 3
+        })
+        for (const tableName of ['drafts', 'carvers', 'nodes'] as const) {
+          await transaction.table(tableName).toCollection().modify((record: StoredRecord) => {
+            record.schemaRev = 3
+          })
+        }
+      })
   }
 }
 
@@ -83,7 +112,7 @@ const drafts: Draft[] = [
   },
 ]
 
-const blocks: Block[] = [
+const blockSeeds: Array<Omit<Block, 'rev'>> = [
   { id: 'block-ms-01', draftId: 'draft-menshen-qin', blockName: '墨线版', colorNo: 1, woodType: '黄杨', thicknessMm: 18, carvedBy: '齐师傅', state: '已刻成', defectNote: '胡须末梢修补一处，不影响线条落墨。' },
   { id: 'block-ms-02', draftId: 'draft-menshen-qin', blockName: '黄版', colorNo: 2, woodType: '梨木', thicknessMm: 20, carvedBy: '周桂枝', state: '在刻', defectNote: '甲胄边线有一处浅崩口，已做嵌补。' },
   { id: 'block-ms-03', draftId: 'draft-menshen-qin', blockName: '红版', colorNo: 3, woodType: '梨木', thicknessMm: 20, carvedBy: '陈小满', state: '待刻', defectNote: '' },
@@ -140,7 +169,7 @@ const carvers: Carver[] = [
   },
 ]
 
-const batches: PrintBatch[] = [
+const batchSeeds: Array<Omit<PrintBatch, 'releaseStatus' | 'blockSnapshots' | 'releaseBasis'>> = [
   {
     id: 'batch-ll-001',
     draftId: 'draft-liannian-youyu',
@@ -176,6 +205,16 @@ const batches: PrintBatch[] = [
   },
 ]
 
+// 内置历史批次同样按旧账处理：只标待复核，印数与逐版偏差保持原记录。
+const batches: PrintBatch[] = batchSeeds.map((batch) => ({
+  ...batch,
+  releaseStatus: '待复核',
+  blockSnapshots: [],
+  releaseBasis: '历史批次：登记时未留存版片状态与崩口快照，请管事复核。',
+}))
+
+const blocks: Block[] = blockSeeds.map((block) => ({ ...block, rev: 1 }))
+
 const nodes: ProcessNode[] = [
   { id: 'node-ms-01', blockId: 'block-ms-01', stage: '起稿', seq: 1, operator: '赵守艺', startedAt: '2026-01-02T08:30', durationMin: 180, note: '确定秦琼、敬德左右对称构图。' },
   { id: 'node-ms-02', blockId: 'block-ms-01', stage: '勾描', seq: 2, operator: '赵守艺', startedAt: '2026-01-03T09:00', durationMin: 240, note: '墨线稿过朱，甲片分界加密。' },
@@ -194,7 +233,7 @@ const nodes: ProcessNode[] = [
 ]
 
 function withSchemaRevision<T extends object>(records: T[]): Array<T & { schemaRev: number }> {
-  return records.map((record) => ({ ...record, schemaRev: 2 }))
+  return records.map((record) => ({ ...record, schemaRev: 3 }))
 }
 
 export const db = new WoodprintDatabase()

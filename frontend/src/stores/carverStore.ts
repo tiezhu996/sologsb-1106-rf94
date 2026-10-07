@@ -58,6 +58,7 @@ async function assignBlock(block: Block, carverId: string): Promise<void> {
     await db.blocks.update(block.id, {
       carvedBy: nextCarver.name,
       state: block.state === '待刻' ? '在刻' : block.state,
+      rev: block.rev + 1,
     })
   })
   await load()

@@ -75,6 +75,7 @@
   }
 
   function blockStage(): { active: number; completed: number } {
+    if (selectedBlocks.some((block) => block.state === '返修中')) return { active: 4, completed: 4 }
     if (selectedBlocks.some((block) => block.state === '已修版')) return { active: 4, completed: 5 }
     if (selectedBlocks.some((block) => block.state === '在刻')) return { active: 3, completed: 3 }
     if (selectedBlocks.some((block) => block.state === '已刻成')) return { active: 4, completed: 4 }
