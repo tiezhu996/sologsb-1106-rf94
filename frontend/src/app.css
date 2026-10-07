@@ -614,6 +614,13 @@ textarea:focus {
   font-size: 0.88rem;
 }
 
+.latest-batch strong .tag {
+  margin-left: 0.45rem;
+  padding: 0.12rem 0.5rem;
+  font-style: normal;
+  vertical-align: middle;
+}
+
 .latest-batch small {
   color: var(--ink-muted);
 }

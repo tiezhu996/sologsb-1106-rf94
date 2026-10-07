@@ -9,4 +9,9 @@ export interface Draft {
   sizeCm: string
   paperNote: string
   status: DraftStatus
+  /**
+   * 可印结论版本号：四块版片 stateRev 之和。
+   * 版片状态一变即重算；null 表示该画稿从未达到过开印条件。
+   */
+  printReadyRev: number | null
 }

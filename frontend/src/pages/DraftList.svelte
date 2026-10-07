@@ -76,6 +76,7 @@
       sizeCm: sizeCm.trim(),
       paperNote: paperNote.trim() || '待选纸后补充',
       status,
+      printReadyRev: null,
     })
 
     const baseColorNames = ['墨线版', '黄版', '红版', '绿版'] as const
@@ -93,6 +94,7 @@
           carvedBy: '',
           state: '待刻',
           defectNote: '',
+          stateRev: 1,
         })
       }
     })
@@ -250,11 +252,16 @@
         <div class="latest-batch">
           <span>最近批次</span>
           {#if data.batch}
-            <strong>{data.batch.batchNo}</strong>
+            <strong>
+              {data.batch.batchNo}
+              <em class="tag {data.batch.releaseState === '已放行' ? 'status-3' : 'status-1'}">
+                {data.batch.releaseState === '已放行' ? '已放行' : '待复核'}
+              </em>
+            </strong>
             <small>{data.batch.printedAt.replace(/-/g, '.')} · 印 {data.batch.qty} 张</small>
           {:else}
             <strong>尚未试印</strong>
-            <small>版片齐备后可登记首批</small>
+            <small>四块版片刻成或修版后可登记首批</small>
           {/if}
         </div>
 

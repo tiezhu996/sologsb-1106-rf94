@@ -2,6 +2,7 @@ import { derived, writable } from 'svelte/store'
 import type { Carver } from '../types/carver'
 import type { Block } from '../types/block'
 import { db } from '../utils/db'
+import { commitBlockStateChangeInTx } from '../utils/printGate'
 
 const carverList = writable<Carver[]>([])
 const blockAssignments = writable<Record<string, string[]>>({})
@@ -45,7 +46,7 @@ async function assignBlock(block: Block, carverId: string): Promise<void> {
   const nextCarver = await db.carvers.get(carverId)
   if (!nextCarver) return
 
-  await db.transaction('rw', db.blocks, db.carvers, async () => {
+  await db.transaction('rw', db.blocks, db.carvers, db.drafts, db.batches, async () => {
     const allCarvers = await db.carvers.toArray()
     for (const carver of allCarvers) {
       const withoutBlock = carver.activeBlockIds.filter((id) => id !== block.id)
@@ -55,10 +56,17 @@ async function assignBlock(block: Block, carverId: string): Promise<void> {
         await db.carvers.update(carver.id, { activeBlockIds: withoutBlock })
       }
     }
-    await db.blocks.update(block.id, {
-      carvedBy: nextCarver.name,
-      state: block.state === '待刻' ? '在刻' : block.state,
-    })
+
+    // 版片由“待刻”转“在刻”属于状态流转：递增版本、重算可印结论、失效旧放行依据。
+    const freshBlock = await db.blocks.get(block.id)
+    if (freshBlock) {
+      const nextState = freshBlock.state === '待刻' ? '在刻' : freshBlock.state
+      if (nextState !== freshBlock.state) {
+        await commitBlockStateChangeInTx(freshBlock, '在刻', { carvedBy: nextCarver.name })
+      } else {
+        await db.blocks.update(freshBlock.id, { carvedBy: nextCarver.name })
+      }
+    }
   })
   await load()
 }
